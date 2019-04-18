@@ -1,19 +1,23 @@
 import argparse
+import signal
 import socket
 from argparse import Namespace
 from queue import Queue
 from socket import AF_INET, SOCK_STREAM
 from threading import Thread, current_thread
-from typing import List, Tuple
+from typing import List, Tuple, TextIO
 
 from decorator import contextmanager
 
 from pykv.gossip import GossipNode, NodeParams
-from pykv.util import read_uint32, read_bytes, send_str, decode_type, read_str, \
-    send_uint32
-
-import signal
-import sys
+from pykv.util import (
+    read_uint32,
+    read_bytes,
+    send_str,
+    decode_type,
+    read_str,
+    send_uint32,
+)
 
 
 def safe_close(sock: socket.socket):
@@ -23,7 +27,9 @@ def safe_close(sock: socket.socket):
         pass
 
 
-def handle_client(client_sock, replication_log: Queue, kv: dict) -> None:
+def handle_client(
+    client_sock, replication_log: Queue, kv: dict, kv_log: TextIO
+) -> None:
     while True:
         n = read_uint32(client_sock)
 
@@ -39,6 +45,9 @@ def handle_client(client_sock, replication_log: Queue, kv: dict) -> None:
             kv[key] = val
             # TODO - append to log
             send_str(client_sock, "OK")
+            kv_log.write(data)
+            kv_log.write("\n")
+            kv_log.flush()
             replication_log.put(data)
         elif data.startswith("get "):
             _, key = data.split(" ")
@@ -57,12 +66,14 @@ def one_off_socket(p: NodeParams) -> socket:
 
 @contextmanager
 def one_time_socket(ip: str, port: int) -> socket:
+    sock = None
     try:
         sock = socket.socket(AF_INET, SOCK_STREAM)
         sock.connect((ip, port))
         yield sock
     finally:
-        sock.close()
+        if sock:
+            sock.close()
 
 
 # need connection pooling
@@ -80,10 +91,10 @@ def replication_broadcast_loop(gossip_node, replication_log: Queue) -> None:
 
 
 def is_bootstrap(cmd: str) -> bool:
-    return cmd.lower().startswith('bootstrap')
+    return cmd.lower().startswith("bootstrap")
 
 
-def replication_listen_loop(replication_port: int, kv: dict) -> None:
+def replication_listen_loop(replication_port: int, kv: dict, kv_log: TextIO) -> None:
     replication_sock = socket.socket(AF_INET, SOCK_STREAM)
     replication_sock.bind(("0.0.0.0", replication_port))
     replication_sock.listen(5)
@@ -92,18 +103,21 @@ def replication_listen_loop(replication_port: int, kv: dict) -> None:
     while True:
         peer_sock, addr = replication_sock.accept()
 
-        _type = decode_type(peer_sock.recv(1)) # i think is reqd
+        _type = decode_type(peer_sock.recv(1))  # i think is reqd
 
         n = read_uint32(peer_sock)
         cmd: str = read_bytes(peer_sock, n).decode("utf-8")
 
         if is_bootstrap(cmd):
-            print(f'Bootstrapping {peer_sock.getsockname()}')
+            print(f"Bootstrapping {peer_sock.getsockname()}")
             send_uint32(peer_sock, len(kv))
             for k, v in kv.items():
-                v_ = f'set {k} {v}'
+                v_ = f"set {k} {v}"
                 print(v_)
                 send_str(peer_sock, v_)  # lol
+                kv_log.write(cmd)
+                kv_log.write("\n")
+                kv_log.flush()
             continue
 
         if not cmd.startswith("set "):
@@ -137,14 +151,23 @@ def read_kv(sock: socket.socket) -> Tuple[str, str]:
 
 
 def bootstrap_kv(seed_port: int) -> dict:
-    with one_time_socket(ip='127.0.0.1', port=seed_port) as sock:
-        send_str(sock, 'bootstrap')
+    with one_time_socket(ip="127.0.0.1", port=seed_port) as sock:
+        send_str(sock, "bootstrap")
         n = read_uint32(sock)
         # import pdb; pdb.set_trace()
-        return dict(
-            read_kv(sock)
-            for _ in range(n)
-        )
+        return dict(read_kv(sock) for _ in range(n))
+
+
+def restore_from_file() -> dict:
+    kv = {}
+    try:
+        with open("kv.log") as fp:
+            for line in fp:
+                _, k, v = line.rstrip().split()
+                kv[k] = v
+            return kv
+    except FileNotFoundError:
+        return kv
 
 
 def main(port: int, gossip_port: int, seed_port: int = None):
@@ -156,10 +179,13 @@ def main(port: int, gossip_port: int, seed_port: int = None):
     5. Accept loop; new thread to handle each new client
     """
 
+    kv = restore_from_file()
+
     if seed_port:
-        kv = bootstrap_kv(seed_port)
-    else:
-        kv = {}
+        # TODO - add timestamps for janky last-write-wins
+        kv.update(bootstrap_kv(seed_port))
+
+    kv_log = open("kv.log", "a")
 
     gossip_node = GossipNode(port=port, gossip_port=gossip_port)
 
@@ -173,7 +199,7 @@ def main(port: int, gossip_port: int, seed_port: int = None):
     Thread(
         target=replication_listen_loop,
         name=f"replication-listen-thread",
-        kwargs=dict(replication_port=gossip_port, kv=kv),
+        kwargs=dict(replication_port=gossip_port, kv=kv, kv_log=kv_log),
         daemon=True,
     ).start()
 
@@ -199,22 +225,24 @@ def main(port: int, gossip_port: int, seed_port: int = None):
     while True:
         try:
             client_sock, _ = sock.accept()
+            Thread(
+                target=handle_client,
+                name=f"client-{i}",
+                kwargs=dict(
+                    client_sock=client_sock,
+                    replication_log=replication_log,
+                    kv=kv,
+                    kv_log=kv_log,
+                ),
+                daemon=True,
+            ).start()
+            i += 1
         except OSError as e:
             import os, signal
 
             os.kill(os.getpid(), signal.SIGTERM)
             exit(22)
             # TODO - will exit(return_code) trigger our signal handlers?
-
-        Thread(
-            target=handle_client,
-            name=f"client-{i}",
-            kwargs=dict(
-                client_sock=client_sock, replication_log=replication_log, kv=kv
-            ),
-            daemon=True,
-        ).start()
-        i += 1
 
 
 def parse_args() -> Namespace:
