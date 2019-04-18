@@ -4,10 +4,13 @@ from argparse import Namespace
 from queue import Queue
 from socket import AF_INET, SOCK_STREAM
 from threading import Thread, current_thread
-from typing import List
+from typing import List, Tuple
+
+from decorator import contextmanager
 
 from pykv.gossip import GossipNode, NodeParams
-from pykv.util import read_uint32, read_bytes, send_str, decode_type
+from pykv.util import read_uint32, read_bytes, send_str, decode_type, read_str, \
+    send_uint32
 
 import signal
 import sys
@@ -52,6 +55,16 @@ def one_off_socket(p: NodeParams) -> socket:
     return sock
 
 
+@contextmanager
+def one_time_socket(ip: str, port: int) -> socket:
+    try:
+        sock = socket.socket(AF_INET, SOCK_STREAM)
+        sock.connect((ip, port))
+        yield sock
+    finally:
+        sock.close()
+
+
 # need connection pooling
 def replication_broadcast_loop(gossip_node, replication_log: Queue) -> None:
     while True:
@@ -66,6 +79,10 @@ def replication_broadcast_loop(gossip_node, replication_log: Queue) -> None:
             sock.close()
 
 
+def is_bootstrap(cmd: str) -> bool:
+    return cmd.lower().startswith('bootstrap')
+
+
 def replication_listen_loop(replication_port: int, kv: dict) -> None:
     replication_sock = socket.socket(AF_INET, SOCK_STREAM)
     replication_sock.bind(("0.0.0.0", replication_port))
@@ -75,8 +92,19 @@ def replication_listen_loop(replication_port: int, kv: dict) -> None:
     while True:
         peer_sock, addr = replication_sock.accept()
 
+        _type = decode_type(peer_sock.recv(1)) # i think is reqd
+
         n = read_uint32(peer_sock)
         cmd: str = read_bytes(peer_sock, n).decode("utf-8")
+
+        if is_bootstrap(cmd):
+            print(f'Bootstrapping {peer_sock.getsockname()}')
+            send_uint32(peer_sock, len(kv))
+            for k, v in kv.items():
+                v_ = f'set {k} {v}'
+                print(v_)
+                send_str(peer_sock, v_)  # lol
+            continue
 
         if not cmd.startswith("set "):
             print("wtf", cmd)
@@ -101,6 +129,24 @@ def init_signal_handlers(sockets: List[socket.socket]) -> None:
     # signal.signal(signal.SIGSTOP, signal_handler) # u_u OSError: [Errno 22] Invalid argument
 
 
+def read_kv(sock: socket.socket) -> Tuple[str, str]:
+    _ = sock.recv(1)
+    cmd = read_str(sock)
+    _, k, v = cmd.split()
+    return k, v
+
+
+def bootstrap_kv(seed_port: int) -> dict:
+    with one_time_socket(ip='127.0.0.1', port=seed_port) as sock:
+        send_str(sock, 'bootstrap')
+        n = read_uint32(sock)
+        # import pdb; pdb.set_trace()
+        return dict(
+            read_kv(sock)
+            for _ in range(n)
+        )
+
+
 def main(port: int, gossip_port: int, seed_port: int = None):
     """
     1. Spin up gossip node
@@ -110,6 +156,11 @@ def main(port: int, gossip_port: int, seed_port: int = None):
     5. Accept loop; new thread to handle each new client
     """
 
+    if seed_port:
+        kv = bootstrap_kv(seed_port)
+    else:
+        kv = {}
+
     gossip_node = GossipNode(port=port, gossip_port=gossip_port)
 
     if seed_port:
@@ -118,8 +169,6 @@ def main(port: int, gossip_port: int, seed_port: int = None):
     gossip_node.start()
 
     replication_log = Queue()
-
-    kv = {}  # where the magic happens
 
     Thread(
         target=replication_listen_loop,
