@@ -39,7 +39,14 @@ class NodeParams:
 def ping_recv_loop(sock: socket.socket, node: "GossipNode") -> None:
     print(f"{current_thread().name} gossip_loop")
     while True:
-        data, _, _, sender = sock.recvmsg(1024)  # should be 1500?
+        try:
+            data, _, _, sender = sock.recvmsg(1024)  # should be 1500?
+        except OSError as e:
+            import os, signal
+
+            os.kill(os.getpid(), signal.SIGTERM)
+            # TODO - will exit(return_code) trigger our signal handlers?
+
         msg = json.loads(data)
         _type = msg["type"]
 
@@ -106,6 +113,10 @@ class GossipNode:
         self.nodes = {}
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # 🎉
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
         self.sock.bind(("127.0.0.1", gossip_port))
         print(self.sock)
 
@@ -115,7 +126,7 @@ class GossipNode:
             name="🗣",
             target=ping_recv_loop,
             kwargs=dict(sock=self.sock, node=self),
-            daemon=False,
+            daemon=True,
         )
 
         self.prune_worker = Thread(

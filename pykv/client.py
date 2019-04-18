@@ -1,8 +1,8 @@
 import socket
 import sys
-from typing import List
+from typing import List, Optional
 
-from pykv.util import send_uint32
+from pykv.util import send_uint32, decode_type, read_str
 
 
 def send_line(sock, line: str) -> int:
@@ -10,6 +10,26 @@ def send_line(sock, line: str) -> int:
     n = len(encoded)
     send_uint32(sock, n)
     return sock.send(encoded)
+
+
+def recv_line(sock: socket.socket) -> Optional[str]:
+    _type = decode_type(sock.recv(1))
+
+    if _type is None:
+        return None
+
+    s = read_str(sock)
+    return s
+
+
+def log(x):
+    if x is None:
+        print("∅")
+    else:
+        print(x)
+
+
+QUITS = ("exit", "quit")
 
 
 def main(argv: List[str]):
@@ -24,9 +44,12 @@ def main(argv: List[str]):
         except EOFError:
             line = None
 
-        if not line:
+        if not line or line.lower() in QUITS:
             break
+
         send_line(sock, line)
+        x = recv_line(sock)
+        log(x)
 
 
 if __name__ == "__main__":

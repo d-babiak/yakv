@@ -1,6 +1,18 @@
 import socket
 import struct
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Any
+
+
+def encode_type(x: Any) -> bytes:
+    meta = 0 if x is None else 1
+    return struct.pack("!B", meta)
+
+
+def decode_type(b: bytes) -> type:
+    assert len(b) == 1
+    n = struct.unpack("!B", b)[0]
+    switch = {0: None, 1: str}  # type(None)  # 💪
+    return switch[n]
 
 
 def encode_uint32(n: int) -> bytes:
@@ -12,7 +24,7 @@ def decode_uint32(data: bytes) -> int:
 
 
 def send_uint32(sock, n) -> int:
-    print(n)
+    # print(n)
     return sock.send(struct.pack("!I", n))
 
 
@@ -42,13 +54,16 @@ def read_bytes(sock: socket.socket, n: int) -> bytes:
 
 
 def send_str(sock: socket.socket, s: Union[str, bytes]) -> None:
+    sock.send(encode_type(s))
+
+    if s is None:
+        return
+
     if isinstance(s, str):
         data = s.encode("utf-8")
     elif isinstance(s, bytes):
         data = s
-    else:
-        raise ValueError(f"Cannot send {s} | types: {type(s)}")
-    n = len(s)
+    n = len(data)
     sock.send(encode_uint32(n))
     sock.send(data)
 
@@ -56,4 +71,6 @@ def send_str(sock: socket.socket, s: Union[str, bytes]) -> None:
 def read_str(sock: socket.socket) -> str:
     n: int = read_uint32(sock)
     data = read_bytes(sock, n)
-    return data.decode('utf-8')
+    # import pdb; pdb.set_trace()
+    # print(repr(data))
+    return data.decode("utf-8")
